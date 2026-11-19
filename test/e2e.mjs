@@ -28,9 +28,12 @@ function gemini(body) {
     // 沒有播放器的影片當成 4 分鐘長：之後的段沒有語音
     if (vid.startsWith("NOEMBED") && from >= 240) return { status: 200, body: reply({ segs: [] }) };
     const segs = [];
+    const gapReq = to - from < 59; // 補漏的請求（一整段是 60 秒）
     for (let s = Math.ceil((from + 1) / 6) * 6 - 5; s < to; s += 6) {
       if (s < from) continue;
       const n = Math.round((s + 5) / 6);
+      // 3:20–3:40：整段轉錄時模型漏掉這 20 秒（照真實情況：講得很密時 Gemini 會跳過一段）；補漏的請求才轉得出來
+      if (!gapReq && s >= 200 && s < 220) continue;
       // 第 120 秒交界：一句話被切成兩半
       if (s >= 114 && s < 120) segs.push({ s: mmss(118), e: mmss(119.9), t: "This sentence crosses the" });
       else if (s >= 120 && s < 126 && from === 120) segs.push({ s: mmss(120.3), e: mmss(122), t: "window boundary." });
@@ -121,14 +124,16 @@ await page.evaluate(() => (window.__fake.seekTo(2), window.__fake.playVideo()));
 const sub = await until(async () => { const t = await text("#subs .box"); return /Spoken line 1/.test(t) && /【譯】/.test(t) ? t : null; });
 check("T1 字幕疊層出現原文＋譯文", !!sub, await text("#subs .box"));
 await sleep(500);
-check("T2 一開始只轉目前那段和下一段（0–2 分、2–4 分）", JSON.stringify(calls.transcribe.map((c) => c.from)) === "[0,120]", JSON.stringify(calls.transcribe));
+check("T2 一開始只轉目前那段和下一段（每段 1 分鐘）", JSON.stringify(calls.transcribe.map((c) => c.from)) === "[0,60]", JSON.stringify(calls.transcribe));
 check("T2b 預設每句短（約 8 字），字幕換得快", calls.transcribe.every((c) => c.words === 8), JSON.stringify(calls.transcribe.map((c) => c.words)));
 const rows = await page.$$eval(".row", (rs) => rs.map((r) => r.textContent));
-check("T3 逐字稿有句子和譯文", rows.length >= 30 && rows.every((r) => /【譯】|…/.test(r)), `${rows.length} 句`);
-const joined = rows.filter((r) => /crosses the/.test(r));
-check("T4 切在 2 分鐘交界的半句接回一句", joined.length === 1 && /crosses the window boundary\./.test(joined[0]), JSON.stringify(joined));
+check("T3 逐字稿有句子和譯文", rows.length >= 15 && rows.every((r) => /【譯】|…/.test(r)), `${rows.length} 句`);
 check("T5 翻譯帶影片標題當上下文", calls.translate.length > 0);
-check("T6 狀態列顯示進度", /已轉好 0:00–4:00/.test(await text("#status")), await text("#status"));
+check("T6 狀態列顯示進度", /已轉好 0:00–2:00/.test(await text("#status")), await text("#status"));
+// 2 分鐘交界：播到第 2 段時會轉第 3 段，兩段都到了就接回一句
+await page.evaluate(() => window.__fake.seekTo(100));
+const joined = await until(async () => { const j = (await page.$$eval(".row", (rs) => rs.map((r) => r.textContent))).filter((r) => /crosses the/.test(r)); return j.length === 1 && /crosses the window boundary\./.test(j[0]) ? j : null; });
+check("T4 切在段落交界的半句接回一句", !!joined, JSON.stringify(joined));
 
 // 點逐字稿的句子 → 跳過去；跳到第 3 段會開始轉第 3 段
 const row = await page.$$(".row");
@@ -137,6 +142,12 @@ await row[target].tap();
 await sleep(300);
 const tAfter = await page.evaluate(() => window.__fake.getCurrentTime());
 check("T7 點逐字稿的句子會跳到那句", Math.abs(tAfter - 175) < 1.5, `${tAfter.toFixed(1)} 秒`);
+// 補漏：3:00–4:00 那段整段轉錄漏了 3:20–3:40，要自動補轉那個空檔
+const filled = await until(async () => (await page.$$eval(".row", (rs) => rs.map((r) => r.textContent))).filter((r) => /Spoken line (35|36|37) /.test(r)).length === 3, 10000);
+const gapCalls = calls.transcribe.filter((c) => c.to - c.from < 59);
+check("G1 漏掉的 20 秒自動補轉回來", !!filled && gapCalls.some((c) => c.from <= 204 && c.to >= 218), JSON.stringify(gapCalls));
+check("G2 補漏只補空檔（沒有空檔的段不多送）", gapCalls.every((c) => c.from >= 180 && c.to <= 240), JSON.stringify(gapCalls));
+check("G3 補回來的句子照時間排、沒有重複", await page.$$eval(".row time", (ts) => { const s = ts.map((t) => t.textContent); return new Set(s).size === s.length; }));
 await page.evaluate(() => window.__fake.seekTo(250));
 check("T8 跳到 4 分之後會轉最後一段", !!(await until(() => calls.transcribe.some((c) => c.from === 240))), JSON.stringify(calls.transcribe.map((c) => c.from)));
 check("T9 目前這句在逐字稿裡高亮", !!(await until(() => page.$eval(".row.cur", (r) => /Spoken line 42 /.test(r.textContent)).catch(() => false))), await text(".row.cur"));
@@ -249,10 +260,11 @@ await loadVideo("https://youtu.be/NOEMBED0001");
 await until(() => page.$eval("#startRow", (e) => getComputedStyle(e).display !== "none"));
 check("N1 不能嵌入的影片會說明", /不允許在其他網站播放/.test(await text("#status")), await text("#status"));
 await tap("#start");
-await until(() => calls.transcribe.filter((c) => c.vid === "NOEMBED0001").length >= 3, 10000);
+const neFull = () => calls.transcribe.filter((c) => c.vid === "NOEMBED0001" && c.to - c.from >= 59).map((c) => c.from);
+await until(() => neFull().length >= 5, 15000);
 await sleep(1500);
-const ne = calls.transcribe.filter((c) => c.vid === "NOEMBED0001").map((c) => c.from);
-check("N2 照順序轉，遇到沒有語音的段就停", JSON.stringify(ne) === "[0,120,240]", JSON.stringify(ne));
+const ne = neFull();
+check("N2 照順序轉，遇到沒有語音的段就停", JSON.stringify(ne) === "[0,60,120,180,240]", JSON.stringify(ne));
 check("N3 逐字稿照樣出現", (await page.$$(".row")).length >= 30);
 
 // 私人影片：直接停並說明

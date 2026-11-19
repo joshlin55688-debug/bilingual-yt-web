@@ -1,12 +1,14 @@
 // 雙語 YT 網頁版：YouTube 官方內嵌播放器＋Gemini 轉錄＋翻譯＋雙語字幕＋逐字稿。
-// 轉錄做法照 bilingual-translate 的 yt-transcribe.js：每段 BL.TRANSCRIBE_WINDOW_S 秒、目前那段＋下一段、
-// 段落交界的半句接回一句。
+// 轉錄做法照 bilingual-translate 的 yt-transcribe.js：目前那段＋下一段、段落交界的半句接回一句。
+// 和插件不同：每段 60 秒（插件 120 秒），而且轉完會補漏。實測（Karpathy 的演講，講得很密）2 分鐘一段時，
+// Gemini 會整段跳過 40 秒左右的話，那段時間就沒有字幕。
 (() => {
   const BL = globalThis.BL, E = globalThis.BLYT;
   const $ = (id) => document.getElementById(id);
-  const W = BL.TRANSCRIBE_WINDOW_S;
+  const W = 60;
   const MAX_INFLIGHT = 2, RETRY_MS = 20000, MAX_TRIES = 3;
-  const NOPLAYER_MAX_WINDOWS = 30; // 不能嵌入播放的影片：照順序轉，最多 1 小時
+  const GAP_S = 5, MAX_GAPS = 4; // 一段裡超過 5 秒沒有句子就補轉那個空檔（每段最多補 4 個）
+  const NOPLAYER_MAX_WINDOWS = 60; // 不能嵌入播放的影片：照順序轉，最多 1 小時
   const YT_API = globalThis.BLYT_YT_API || "https://www.youtube.com/iframe_api";
   const LS_LAST = "blyt-last";
 
@@ -192,6 +194,7 @@
       w.st = 2;
       w.n = insert(i, r.cues);
       translatePending();
+      if (r.cues.length) fillGaps(v, gen, i, from, to, r.cues);
     } else {
       w.st = 3;
       w.err = r.error || "沒有回應";
@@ -206,10 +209,37 @@
     progress();
     schedule();
   }
-  // 段落交界：重疊超過一半的丟掉、保持照時間排；切在交界的半句兩段都到了就接回一句（接起來的重新翻譯）
+  // 補漏：這段裡超過 GAP_S 秒沒有句子的地方，單獨再轉一次（前後各多 0.5 秒）。
+  // 沒人講話的空檔（音樂、停頓）也會送一次，回來是空的，費用很少。補到的句子併進同一段
+  async function fillGaps(v, gen, i, from, to, cues) {
+    const gaps = [];
+    let prev = from;
+    for (const c of [...cues].sort((a, b) => a.start - b.start)) {
+      if (c.start / 1000 - prev > GAP_S) gaps.push([prev, c.start / 1000]);
+      prev = Math.max(prev, c.end / 1000);
+    }
+    if (to - prev > GAP_S) gaps.push([prev, to]);
+    for (const [a, b] of gaps.slice(0, MAX_GAPS)) {
+      const f = Math.max(from, Math.floor(a * 10) / 10 - 0.5), t = Math.min(to, Math.ceil(b * 10) / 10 + 0.5);
+      if (t - f < 2) continue;
+      v.gapBusy = (v.gapBusy || 0) + 1;
+      progress();
+      const r = await E.transcribeWindow(v.vid, f, t, v.lang);
+      if (v !== V || v.gen !== gen) return;
+      v.gapBusy--;
+      if (r.cues?.length) {
+        win(i).n += insert(i, r.cues);
+        v.gapFilled = (v.gapFilled || 0) + r.cues.length;
+        translatePending();
+      }
+    }
+    progress();
+  }
+  // 段落交界：重疊超過一半的丟掉、保持照時間排；切在交界的半句兩段都到了就接回一句（接起來的重新翻譯）。
+  // 同一段可以分好幾次併進來（補漏）
   function insert(i, cues) {
     const all = V.cues;
-    const before = all.filter((c) => c.w < i), after = all.filter((c) => c.w > i);
+    const before = all.filter((c) => c.w < i), after = all.filter((c) => c.w > i), same = all.filter((c) => c.w === i);
     const minStart = before.length ? before[before.length - 1].start : -Infinity;
     const maxStart = after.length ? after[0].start : Infinity;
     const keep = cues
@@ -219,7 +249,7 @@
         return !all.some((u) => Math.min(u.end, c.end) - Math.max(u.start, c.start) > dur / 2);
       })
       .map((c) => ({ ...c, w: i }));
-    V.cues = [...before, ...keep, ...after];
+    V.cues = [...before, ...[...same, ...keep].sort((a, b) => a.start - b.start), ...after];
     joinAt(i);
     joinAt(i + 1);
     renderList();
@@ -244,7 +274,7 @@
     }
     const end = (i) => (V.dur ? Math.min(V.dur, (i + 1) * W) : (i + 1) * W) * 1000;
     const txt = ranges.map((r) => `${clock(r.lo * W * 1000)}–${clock(end(r.hi - 1))}`).join("、");
-    const busy = [...V.wins.values()].some((w) => w.st === 1);
+    const busy = [...V.wins.values()].some((w) => w.st === 1) || V.gapBusy > 0;
     const here = noPlayer ? null : V.wins.get(Math.floor(nowMs() / 1000 / W));
     const failed = here?.st === 3 ? `這段轉錄失敗：${here.err}${here.tries < MAX_TRIES ? "（稍後重試）" : ""}` : "";
     const all = !noPlayer && V.dur && done.length >= n;
