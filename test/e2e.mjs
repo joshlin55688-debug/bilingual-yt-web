@@ -22,7 +22,8 @@ function gemini(body) {
     const vid = new URL(file.fileData.fileUri).searchParams.get("v");
     const meta = parts.find((p) => p.videoMetadata)?.videoMetadata || file.videoMetadata;
     const from = parseFloat(meta.startOffset), to = parseFloat(meta.endOffset);
-    calls.transcribe.push({ vid, from, to });
+    const words = Number(/max about (\d+) words/.exec(parts.find((p) => p.text)?.text || "")?.[1]);
+    calls.transcribe.push({ vid, from, to, words });
     if (vid.startsWith("PRIVATE")) return { status: 400, body: { error: { message: "The video is not available (private)." } } };
     // 沒有播放器的影片當成 4 分鐘長：之後的段沒有語音
     if (vid.startsWith("NOEMBED") && from >= 240) return { status: 200, body: reply({ segs: [] }) };
@@ -33,7 +34,8 @@ function gemini(body) {
       // 第 120 秒交界：一句話被切成兩半
       if (s >= 114 && s < 120) segs.push({ s: mmss(118), e: mmss(119.9), t: "This sentence crosses the" });
       else if (s >= 120 && s < 126 && from === 120) segs.push({ s: mmss(120.3), e: mmss(122), t: "window boundary." });
-      else segs.push({ s: mmss(s), e: mmss(s + 4), t: `Spoken line ${n} of the talk.` });
+      // 第 8 句：模型把結束時間標太長（43 秒開始、標成 58 秒結束）
+      else segs.push({ s: mmss(s), e: mmss(s + (n === 8 ? 15 : 4)), t: `Spoken line ${n} of the talk.` });
     }
     return { status: 200, body: reply({ segs }) };
   }
@@ -120,6 +122,7 @@ const sub = await until(async () => { const t = await text("#subs .box"); return
 check("T1 字幕疊層出現原文＋譯文", !!sub, await text("#subs .box"));
 await sleep(500);
 check("T2 一開始只轉目前那段和下一段（0–2 分、2–4 分）", JSON.stringify(calls.transcribe.map((c) => c.from)) === "[0,120]", JSON.stringify(calls.transcribe));
+check("T2b 預設每句短（約 8 字），字幕換得快", calls.transcribe.every((c) => c.words === 8), JSON.stringify(calls.transcribe.map((c) => c.words)));
 const rows = await page.$$eval(".row", (rs) => rs.map((r) => r.textContent));
 check("T3 逐字稿有句子和譯文", rows.length >= 30 && rows.every((r) => /【譯】|…/.test(r)), `${rows.length} 句`);
 const joined = rows.filter((r) => /crosses the/.test(r));
@@ -177,11 +180,42 @@ check("D1 點單字跳出字典卡片", !!card, await text("#cardBody"));
 check("D2 查單字時影片暫停", (await page.evaluate(() => window.__fake.getPlayerState())) === 2);
 await tap("#cardClose");
 
+// 字幕時間：講完就收掉；結束時間標太長也不會一直停著；可以微調
+await page.evaluate(() => (window.__fake.pauseVideo(), window.__fake.seekTo(48.2)));
+await sleep(400);
+check("O1 結束時間標太長的句子，依字數上限收掉（不會停到下一句）", (await text("#subs .box")) === "", await text("#subs .box"));
+await tap("#offEarlier");
+await tap("#offEarlier");
+await sleep(400);
+check("O2 字幕提早 1 秒：顯示下一句", /Spoken line 9 /.test(await text("#subs .box")) && /提早 1\.0 秒/.test(await text("#offVal")), `${await text("#subs .box")}｜${await text("#offVal")}`);
+await tap("#offLater");
+await tap("#offLater");
+check("O3 微調可以調回 0", /0\.0 秒/.test(await text("#offVal")));
+
+// 字幕大小
+await page.select("#subSize", "l");
+const fsL = await page.$eval("#subs .box", (e) => parseFloat(getComputedStyle(e).fontSize));
+await page.select("#subSize", "s");
+const fsS = await page.$eval("#subs .box", (e) => parseFloat(getComputedStyle(e).fontSize));
+check("Z1 字幕大小可以切換（預設小）", fsS < fsL && fsS <= 18, `小 ${fsS}px、大 ${fsL}px`);
+
 // 下載 SRT
 await tap("#srt");
 const srtFile = await until(() => fs.readdirSync(dl).find((f) => f.endsWith(".srt")));
 const srt = srtFile ? fs.readFileSync(path.join(dl, srtFile), "utf8") : "";
 check("S1 下載雙語 SRT（檔名用影片標題）", srtFile === "Fake talk about libraries.zh-TW.srt" && /Spoken line 1 of the talk\.\n【譯】Spoken line 1/.test(srt), srtFile);
+
+// 每句長度改成長：從目前位置重新轉錄，送出的提示是 15 字
+const nBefore = calls.transcribe.length;
+await page.evaluate(() => window.__fake.seekTo(30));
+await page.select("#subLen", "long");
+await until(() => calls.transcribe.length > nBefore);
+await sleep(800);
+const again = calls.transcribe.slice(nBefore);
+check("Z2 改每句長度：從目前位置重新轉錄（15 字）", again.length >= 1 && again.every((c) => c.words === 15) && again[0].from === 0, JSON.stringify(again));
+check("Z3 重新轉錄後逐字稿照樣出現", !!(await until(async () => (await page.$$(".row")).length >= 20)));
+await page.select("#subLen", "short");
+await sleep(800);
 
 // 版面：直放、橫放都沒有橫向捲動
 await page.screenshot({ path: path.join(outDir, "portrait.png") });

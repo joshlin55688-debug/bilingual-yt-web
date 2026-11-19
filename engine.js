@@ -13,9 +13,13 @@
     instructions: "",
     subStyle: "dual", // dual：原文＋譯文；translation：只顯示譯文；blur：譯文模糊
     autoPause: false,
+    subSize: "s", // 字幕大小：s／m／l
+    subOffset: 0, // 字幕時間微調（秒）：正數＝提早
+    subLen: "short", // 字幕長度：short（每句約 8 字，換得快）／medium（12）／long（15，和插件一樣）
     customPrices: {},
   };
   const BATCH = { maxItems: 12, maxChars: 2400 };
+  const SUB_LEN_WORDS = { short: 8, medium: 12, long: 15 };
   const CONCURRENCY = 4, MIN_GAP_MS = 100, MAX_ATTEMPTS = 4, REQUEST_TIMEOUT_MS = 60000;
   const CACHE_TTL_MS = 60 * 24 * 3600 * 1000, CACHE_MAX = 50000;
   const LS = "blyt-settings", LS_USAGE = "blyt-usage";
@@ -183,14 +187,15 @@
     if (!/^[\w-]{11}$/.test(videoId) || !(from >= 0) || !(to > from) || to - from > 600) return { error: "轉錄參數不對" };
     const s = getSettings();
     if (!s.apiKey) return { error: "還沒有填 Gemini API 金鑰（右上角「設定」）", code: "no-key" };
-    const k = `tt|${BL.TRANSCRIBE_VERSION}|${BL.TRANSCRIBE_MODEL}|${videoId}|${lang}|${from}|${to}`;
+    const maxWords = SUB_LEN_WORDS[s.subLen] || SUB_LEN_WORDS.short;
+    const k = `tt|${BL.TRANSCRIBE_VERSION}|${BL.TRANSCRIBE_MODEL}|${videoId}|${lang}|${from}|${to}|${maxWords}`;
     const [hit] = await cacheGet([k]).catch(() => [null]);
     if (hit) return { cues: hit, cached: true };
     const ts = { ...s, model: BL.TRANSCRIBE_MODEL };
     let last = "";
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const body = await callGemini(ts, (mode) => BL.transcribeBody(videoId, from, to, lang, { thinking: mode }));
+        const body = await callGemini(ts, (mode) => BL.transcribeBody(videoId, from, to, lang, { thinking: mode, maxWords }));
         const r = BL.parseTranscript(body, from, to);
         if (r.ok) {
           await cachePut([[k, r.cues]]).catch(() => {});
@@ -291,5 +296,5 @@
     }
   }
 
-  g.BLYT = { DEFAULTS, getSettings, saveSettings, transcribeWindow, translateTexts, lookupWord, testConnection, usageReport, resetUsage, cacheClear, cachePrune };
+  g.BLYT = { DEFAULTS, SUB_LEN_WORDS,getSettings, saveSettings, transcribeWindow, translateTexts, lookupWord, testConnection, usageReport, resetUsage, cacheClear, cachePrune };
 })(globalThis);

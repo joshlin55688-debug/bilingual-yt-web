@@ -178,7 +178,7 @@
     progress();
   }
   async function request(i, w) {
-    const v = V;
+    const v = V, gen = v.gen;
     v.inflight++;
     w.st = 1;
     w.tries++;
@@ -186,7 +186,7 @@
     const from = i * W;
     const to = v.dur ? Math.min(Math.ceil(v.dur), (i + 1) * W) : (i + 1) * W;
     const r = await E.transcribeWindow(v.vid, from, to, v.lang);
-    if (v !== V) return;
+    if (v !== V || v.gen !== gen) return; // 換了影片，或改了每句長度（舊長度的結果不要）
     v.inflight--;
     if (r.cues) {
       w.st = 2;
@@ -298,7 +298,16 @@
     if (c.tr) box.append(Object.assign(document.createElement("div"), { className: "tr", textContent: c.tr }));
     else if (subStyle() === "translation") box.append(Object.assign(document.createElement("div"), { className: "o", textContent: c.text }));
   }
-  // 目前時間對到哪一句：在句子裡面，或剛講完 1.5 秒內（下一句還沒開始）
+  // 一句顯示到什麼時候：Gemini 標的結束時間、下一句開始（一定讓位）、依字數估的上限（結束時間標太長時，
+  // 舊字幕會一直停著）三者取最早。上限：英文每個字 0.6 秒、中日韓每個字 0.3 秒，再加 1 秒
+  function shownEnd(i) {
+    const cs = V.cues, c = cs[i];
+    const latin = (c.text.match(/[\p{Script=Latin}\p{Script=Cyrillic}\p{Script=Greek}]+/gu) || []).length;
+    const cjk = (c.text.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu) || []).length;
+    const cap = c.start + 1000 + latin * 600 + cjk * 300;
+    return Math.min(c.end, cs[i + 1]?.start ?? Infinity, cap);
+  }
+  // 目前時間對到哪一句（只在這句的顯示時間內）
   function cueAt(t) {
     const cs = V?.cues || [];
     let lo = 0, hi = cs.length - 1, idx = -1;
@@ -307,22 +316,22 @@
       if (cs[mid].start <= t) (idx = mid), (lo = mid + 1);
       else hi = mid - 1;
     }
-    if (idx < 0) return -1;
-    const c = cs[idx];
-    return t < c.end + 1500 ? idx : -1;
+    return idx >= 0 && t < shownEnd(idx) ? idx : -1;
   }
+  // 字幕時間微調：正數＝字幕提早（字幕比講話慢的時候用）
+  const offsetMs = () => Math.round((Number(E.getSettings().subOffset) || 0) * 1000);
   function tick() {
     if (!V || !playerReady) return;
-    const t = nowMs();
+    const t = nowMs() + offsetMs();
     const i = cueAt(t);
     const c = i >= 0 ? V.cues[i] : null;
-    showSub(c && t < c.end + 1500 ? c : null);
+    showSub(c);
     if (i !== curIdx) {
       curIdx = i;
       highlight();
     }
     // 句尾暫停：播過這句的結尾就停一次
-    if (E.getSettings().autoPause && c && t >= c.end - 80 && pausedFor !== i && player.getPlayerState?.() === 1) {
+    if (E.getSettings().autoPause && c && t >= shownEnd(i) - 230 && pausedFor !== i && player.getPlayerState?.() === 1) {
       pausedFor = i;
       player.pauseVideo();
     }
@@ -441,9 +450,36 @@
     $("autoPause").classList.toggle("on", !!s.autoPause);
     $("autoPause").setAttribute("aria-pressed", String(!!s.autoPause));
     $("subStyle").value = s.subStyle;
+    $("subSize").value = s.subSize;
+    $("subLen").value = s.subLen;
+    $("subs").dataset.size = s.subSize;
+    const off = Number(s.subOffset) || 0;
+    $("offVal").textContent = off === 0 ? "0.0 秒" : off > 0 ? `提早 ${off.toFixed(1)} 秒` : `延後 ${(-off).toFixed(1)} 秒`;
   }
   $("autoPause").addEventListener("click", () => (E.saveSettings({ autoPause: !E.getSettings().autoPause }), syncToggles()));
   $("subStyle").addEventListener("change", () => (E.saveSettings({ subStyle: $("subStyle").value }), showSub(null), tick()));
+  const nudge = (d) => {
+    const cur = Number(E.getSettings().subOffset) || 0;
+    E.saveSettings({ subOffset: Math.max(-5, Math.min(5, Math.round((cur + d) * 10) / 10)) });
+    syncToggles();
+    tick();
+  };
+  $("offEarlier").addEventListener("click", () => nudge(0.5));
+  $("offLater").addEventListener("click", () => nudge(-0.5));
+  $("subSize").addEventListener("change", () => (E.saveSettings({ subSize: $("subSize").value }), syncToggles()));
+  // 每句長度改了：從目前位置重新轉錄（已經轉好的長句子丟掉；之前轉過的長度還在快取裡，改回去不用再付錢）
+  $("subLen").addEventListener("change", () => {
+    E.saveSettings({ subLen: $("subLen").value });
+    if (!V) return;
+    V.wins = new Map();
+    V.cues = [];
+    V.gen = (V.gen || 0) + 1;
+    V.inflight = 0;
+    curIdx = -1;
+    showSub(null);
+    renderList();
+    if (V.started) setStatus("每句長度改了，從目前位置重新轉錄…"), schedule();
+  });
   $("subs").addEventListener("click", () => $("subs").querySelector(".tr")?.classList.toggle("peek"));
   $("fs").addEventListener("click", async () => {
     try {
