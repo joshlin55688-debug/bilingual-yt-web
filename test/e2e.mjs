@@ -49,7 +49,9 @@ function gemini(body) {
   }
   const items = JSON.parse(parts[0].text).items;
   calls.translate.push(...items);
-  return { status: 200, body: reply({ t: items.map((x) => "【譯】" + x) }) };
+  // 照真實情況：模型偶爾整批照抄原文。第 30–33 句所在的整批請求照抄（單句重翻才翻得出來）；第 35 句永遠照抄
+  const echo = items.some((x) => /line 35 /.test(x)) || (items.length > 1 && items.some((x) => /line 3[0-3] /.test(x)));
+  return { status: 200, body: reply({ t: items.map((x) => (echo ? x : "【譯】" + x)) }) };
 }
 
 const server = http.createServer((req, res) => {
@@ -148,6 +150,14 @@ const gapCalls = calls.transcribe.filter((c) => c.to - c.from < 59);
 check("G1 漏掉的 20 秒自動補轉回來", !!filled && gapCalls.some((c) => c.from <= 204 && c.to >= 218), JSON.stringify(gapCalls));
 check("G2 補漏只補空檔（沒有空檔的段不多送）", gapCalls.every((c) => c.from >= 180 && c.to <= 240), JSON.stringify(gapCalls));
 check("G3 補回來的句子照時間排、沒有重複", await page.$$eval(".row time", (ts) => { const s = ts.map((t) => t.textContent); return new Set(s).size === s.length; }));
+// 照抄原文：整批沒翻要抓出來單句重翻；重翻還是原文就顯示翻譯失敗，不能把英文當譯文
+const rowOf = (n) => page.evaluate((n) => [...document.querySelectorAll(".row")].find((r) => new RegExp(`Spoken line ${n} `).test(r.textContent))?.textContent || "", n);
+const echoFixed = await until(async () => { for (const n of [30, 31, 32, 33]) if (!/【譯】/.test(await rowOf(n))) return false; return true; }, 10000);
+check("E2 整批照抄原文時，自動單句重翻成功", !!echoFixed, await rowOf(31));
+const echoFail = await until(async () => /翻譯失敗/.test(await rowOf(35)), 10000);
+check("E3 重翻還是原文就顯示翻譯失敗（不把英文當譯文）", !!echoFail, await rowOf(35));
+const cachedEcho = await page.evaluate(async () => (await BLYT.translateTexts(["Spoken line 35 of the talk."]))[0]);
+check("E4 照抄的結果不存快取（之後會再試）", !!cachedEcho.error && !cachedEcho.cached, JSON.stringify(cachedEcho));
 await page.evaluate(() => window.__fake.seekTo(250));
 check("T8 跳到 4 分之後會轉最後一段", !!(await until(() => calls.transcribe.some((c) => c.from === 240))), JSON.stringify(calls.transcribe.map((c) => c.from)));
 check("T9 目前這句在逐字稿裡高亮", !!(await until(() => page.$eval(".row.cur", (r) => /Spoken line 42 /.test(r.textContent)).catch(() => false))), await text(".row.cur"));

@@ -219,10 +219,18 @@
     const mid = Math.ceil(texts.length / 2);
     return [...(await translateGroup(s, texts.slice(0, mid), context)), ...(await translateGroup(s, texts.slice(mid), context))];
   }
+  // 模型偶爾把原文照抄回來（整批都沒翻）。翻成中日韓時：原文有英文字、譯文卻一個中日韓字都沒有；其他語言：和原文一模一樣
+  const CJK_TARGET = /^(zh|ja|ko)/;
+  const CJK_CHAR = /[぀-ヿ㐀-鿿가-힯豈-﫿]/;
+  const norm = (t) => String(t || "").replace(/\s+/g, " ").trim().toLowerCase();
+  function untranslated(lang, src, out) {
+    if (CJK_TARGET.test(lang)) return (String(src).match(/[A-Za-z]/g) || []).length >= 3 && !CJK_CHAR.test(src) && !CJK_CHAR.test(out || "");
+    return norm(src).split(" ").length >= 3 && norm(src) === norm(out);
+  }
   async function withRepair(s, srcs, outs, context) {
     const wrongScript = (src, out) => s.targetLang === "zh-TW" && BL.hasSimplified(out) && !BL.hasSimplified(src);
     const mapScript = (src, out) => (wrongScript(src, out) && BL.zhScript(out) === "hant" ? BL.toTraditional(out) : out);
-    const good = (src, out) => BL.checkTranslation(src, out).ok && !wrongScript(src, out);
+    const good = (src, out) => BL.checkTranslation(src, out).ok && !wrongScript(src, out) && !untranslated(s.targetLang, src, out);
     return Promise.all(
       outs.map(async (out, i) => {
         out = mapScript(srcs[i], out);
@@ -232,6 +240,8 @@
           const [again] = await translateGroup(s, [srcs[i]], context, fix);
           out = mapScript(srcs[i], again);
         } catch {}
+        // 單句重翻還是原文：當成失敗（不存快取，之後會再試）
+        if (untranslated(s.targetLang, srcs[i], out)) return null;
         return BL.finalize(srcs[i], out).text;
       }),
     );
@@ -248,15 +258,16 @@
       BL.splitTokens(out)
         .map((p) => (/^@\d+#$/.test(p) ? masks[i].masked[p.slice(1, -1)] ?? "" : p))
         .join("");
-    const results = send.map((_, i) => (cached[i] != null ? { text: unmask(i, cached[i]), cached: true } : null));
+    // 舊版存進快取的「照抄原文」不算數，重翻
+    const results = send.map((t, i) => (cached[i] != null && !untranslated(s.targetLang, t, cached[i]) ? { text: unmask(i, cached[i]), cached: true } : null));
     const misses = send.map((text, i) => ({ text, i })).filter((x) => !results[x.i]);
     await Promise.all(
       BL.group(misses, BATCH).map(async (grp) => {
         const srcs = grp.map((x) => x.text);
         try {
           const outs = await withRepair(s, srcs, await translateGroup(s, srcs, context), context);
-          grp.forEach((x, k) => (results[x.i] = { text: unmask(x.i, outs[k]) }));
-          const keep = (k) => !(s.targetLang === "zh-TW" && BL.hasSimplified(outs[k]) && !BL.hasSimplified(srcs[k]));
+          grp.forEach((x, k) => (results[x.i] = outs[k] == null ? { error: "模型沒有翻譯（回傳原文）", retry: true } : { text: unmask(x.i, outs[k]) }));
+          const keep = (k) => outs[k] != null && !(s.targetLang === "zh-TW" && BL.hasSimplified(outs[k]) && !BL.hasSimplified(srcs[k]));
           await cachePut(grp.flatMap((x, k) => (keep(k) ? [[keys[x.i], outs[k]]] : []))).catch(() => {});
         } catch (e) {
           grp.forEach((x) => (results[x.i] = { error: e.message || String(e) }));
