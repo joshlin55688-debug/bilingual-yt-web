@@ -75,6 +75,34 @@
   .hint { color: var(--muted); font-size: 13px; }
   .rowflex { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   textarea { min-height: 80px; resize: vertical; }
+  /* 單字表：影片右上角「本集 N 個字」 */
+  #vocab { position: absolute; top: 8%; right: 2%; width: clamp(170px, 26%, 320px); z-index: 6; display: flex; flex-direction: column; align-items: flex-end; font-size: clamp(11px, 1.25vw, 16px); }
+  #stage:fullscreen #vocab { font-size: clamp(13px, 1.4vw, 20px); }
+  #vocab[hidden] { display: none; }
+  #vocab .vp { box-sizing: border-box; width: 100%; color: #fff; background: rgba(16, 16, 16, .55); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); border-radius: 10px; padding: .45em .5em; }
+  #vocab .hd { display: flex; align-items: center; gap: .35em; font-size: .8em; color: #ddd; margin: 0 .2em .3em; }
+  #vocab .ttl { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #vocab .pos { color: #aaa; font-variant-numeric: tabular-nums; }
+  #vocab button { all: unset; cursor: pointer; color: #ddd; padding: .1em .35em; border-radius: 4px; white-space: nowrap; min-height: 0; }
+  #vocab button:disabled { opacity: .4; cursor: default; }
+  #vocab .it { display: flex; align-items: center; gap: .4em; padding: .25em .4em; border-radius: 6px; cursor: pointer; opacity: .62; }
+  #vocab .it.on { opacity: 1; background: rgba(255, 255, 255, .17); }
+  #vocab .tx { flex: 1; min-width: 0; }
+  #vocab .t { display: block; font-family: Georgia, "Times New Roman", serif; font-weight: 700; font-size: 1.12em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #vocab .z { display: block; font-size: .78em; color: #ccc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #vocab .c { font-size: .7em; color: #aaa; }
+  #vocab .st { color: #ffd45e; font-size: 1.1em; }
+  #vocab .it.known { opacity: .32; }
+  #vocab .it.known.on { opacity: .6; }
+  #vocab .fl { font-size: .62em; padding: 0 .35em; border-radius: 4px; border: 1px solid currentColor; }
+  #vocab .fl.learning { color: #ffd45e; }
+  #vocab .fl.mastered { color: #9be7a8; }
+  #vocab .empty { font-size: .8em; color: #bbb; padding: .2em .4em; }
+  #vocab .pill { background: rgba(16, 16, 16, .6); color: #fff; padding: .35em .7em; border-radius: 14px; }
+  #vocab [hidden] { display: none !important; }
+  #subs .hl { color: #7fe0c4; }
+  .row .hl { color: #0b7a5c; font-weight: 600; }
+  @media (prefers-color-scheme: dark) { .row .hl { color: #7fe0c4; } }
   pre#usage { white-space: pre-wrap; margin: 0; font: 13px/1.5 inherit; color: var(--muted); }
 </style>
 </head>
@@ -96,6 +124,10 @@
       <div id="empty">貼上 YouTube 影片網址，按「載入」。<br>第一次使用請先到「設定」填 Gemini API 金鑰。</div>
       <div id="yt"></div>
       <div id="subs"><div class="box"></div></div>
+      <div id="vocab" hidden>
+        <div class="vp"><div class="hd"><span class="ttl"></span><span class="pos"></span><button type="button" data-act="export" title="把收藏的字送到閃卡"></button><button type="button" data-act="collapse" title="收起單字表">–</button></div><div class="ls"></div></div>
+        <button type="button" class="pill" data-act="expand" title="打開單字表" hidden></button>
+      </div>
     </div>
     <div id="startRow"><span id="estimate"></span><button id="start" class="primary">開始產生字幕</button></div>
     <div id="controls">
@@ -145,6 +177,17 @@
       <span class="hint">gemini-3.5-flash-lite 最便宜；gemini-3.8-flash 品質通常較好、較貴。轉錄固定用 flash-lite。</span>
       <input id="model" type="text" list="models"><datalist id="models"><option value="gemini-3.5-flash-lite"><option value="gemini-3.8-flash"></datalist>
     </label>
+    <label class="rowflex"><input id="vocab" type="checkbox"> 單字表（影片右上角「本集 N 個字」）</label>
+    <span class="hint" style="margin-top:-8px">翻譯時另外請 Gemini 挑片語和較難的單字（大約多三成翻譯費）。字幕裡上色、點字跳到那一句、☆ 收藏後可以送到閃卡。</span>
+    <label>單字表不列的單字
+      <select id="vocabMinLevel">
+        <option value="2">學測 Level 1</option><option value="3">學測 Level 1–2</option><option value="4">學測 Level 1–3</option><option value="5">學測 Level 1–4</option>
+      </select>
+    </label>
+    <label>閃卡網址
+      <span class="hint">「→ 閃卡」會打開這個網址，收藏的字放在網址 # 後面帶過去（不會送到伺服器）。</span>
+      <input id="flashcardUrl" type="text" inputmode="url">
+    </label>
     <label>術語表
       <span class="hint">一行一個「原文 = 譯文」，右邊留空代表保留原文。例如：TSMC = 台積電</span>
       <textarea id="glossary"></textarea>
@@ -160,6 +203,7 @@
 </dialog>
 
 <script src="lib/core.js"></script>
+<script src="lib/ceec-levels.js"></script>
 <script src="engine.js"></script>
 <script src="app.js"></script>
 </body>

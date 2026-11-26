@@ -17,6 +17,10 @@
     subOffset: 0, // 字幕時間微調（秒）：正數＝提早
     subLen: "short", // 字幕長度：short（每句約 8 字，換得快）／medium（12）／long（15，和插件一樣）
     customPrices: {},
+    vocab: true, // 單字表：翻譯時另外請 Gemini 挑片語和較難的單字（多一次請求）
+    vocabMinLevel: 4, // 大考中心詞彙表這一級以下的單字不列（片語都列）
+    vocabCollapsed: false,
+    flashcardUrl: "https://joshlin55688-debug.github.io/english-flashcard/flashcard_system.html", // 「→ 閃卡」打開的網址
   };
   const BATCH = { maxItems: 12, maxChars: 2400 };
   const SUB_LEN_WORDS = { short: 8, medium: 12, long: 15 };
@@ -296,6 +300,31 @@
     }
   }
 
+  // ---------- 單字表：一段字幕挑片語和單字（和插件 sw.js 的 vocabBlock 一樣） ----------
+  // 回傳 {items: [{i, term, base, zh, level}]}（已照詞彙表級別過濾）；失敗回 {error}。快取存過濾前的結果
+  async function vocabBlock(texts, context = null) {
+    const s = getSettings();
+    if (!s.apiKey) return { error: "還沒有填 Gemini API 金鑰" };
+    if (!BL.vocabApplies(texts)) return { items: [] };
+    const key = await cacheKey(s, `vocab|${BL.VOCAB_VERSION}|${texts.join("\n")}`);
+    const [hit] = await cacheGet([key]).catch(() => [null]);
+    let items = hit != null ? JSON.parse(hit) : null;
+    if (!items) {
+      try {
+        const body = await callGemini(s, (mode) => BL.vocabBody(texts, s.targetLang, { thinking: mode, context }));
+        const parsed = BL.parseVocab(body, texts);
+        if (!parsed.ok) return { error: `單字表結果不合格（${parsed.error}）` };
+        items = parsed.items;
+      } catch (e) {
+        return { error: e.message || String(e) };
+      }
+      if (s.targetLang === "zh-TW") items.forEach((x) => (x.zh = BL.toTraditional(x.zh)));
+      await cachePut([[key, JSON.stringify(items)]]).catch(() => {});
+    }
+    const min = Number(s.vocabMinLevel) || 4;
+    return { items: items.filter((x) => BL.vocabKeep(x, min)).map((x) => ({ ...x, level: BL.ceecLevel(x.base) || BL.ceecLevel(x.term) })) };
+  }
+
   // 測試連線：一句固定的英文
   async function testConnection() {
     try {
@@ -307,5 +336,5 @@
     }
   }
 
-  g.BLYT = { DEFAULTS, SUB_LEN_WORDS,getSettings, saveSettings, transcribeWindow, translateTexts, lookupWord, testConnection, usageReport, resetUsage, cacheClear, cachePrune };
+  g.BLYT = { DEFAULTS, SUB_LEN_WORDS,getSettings, saveSettings, transcribeWindow, translateTexts, vocabBlock, lookupWord, testConnection, usageReport, resetUsage, cacheClear, cachePrune };
 })(globalThis);

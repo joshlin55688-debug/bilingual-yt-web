@@ -75,7 +75,8 @@
     if (!vid) return setStatus("看不懂這個網址：請貼 YouTube 影片網址（例如 https://youtu.be/xxxxxxxxxxx）", true);
     stopAll();
     lsSet(LS_LAST, JSON.stringify({ url: $("url").value.trim(), lang: $("videoLang").value }));
-    V = { vid, lang: $("videoLang").value, title: "", dur: 0, wins: new Map(), inflight: 0, cues: [], started: false };
+    V = { vid, lang: $("videoLang").value, title: "", dur: 0, wins: new Map(), inflight: 0, cues: [], started: false, vocab: newVocab() };
+    vbLast = "";
     noPlayer = false;
     playerReady = false;
     $("empty").style.display = "none";
@@ -308,6 +309,7 @@
         renderList();
         const err = res.find((r) => r?.error);
         if (err) setStatus(`翻譯失敗：${err.error}`, true);
+        vocabPump();
       }
     } finally {
       translating = false;
@@ -318,13 +320,17 @@
   const subStyle = () => E.getSettings().subStyle;
   function showSub(c) {
     const box = $("subs").firstElementChild;
-    const key = c ? `${c.start}|${c.text}|${c.tr ?? ""}|${subStyle()}` : "";
+    const key = c ? `${c.start}|${c.text}|${c.tr ?? ""}|${subStyle()}|${V?.vocab?.ver || 0}` : "";
     if (box.dataset.key === key) return;
     box.dataset.key = key;
     box.replaceChildren();
     $("subs").classList.toggle("blur", subStyle() === "blur");
     if (!c) return;
-    if (subStyle() !== "translation") box.append(Object.assign(document.createElement("div"), { className: "o", textContent: c.text }));
+    if (subStyle() !== "translation") {
+      const o = Object.assign(document.createElement("div"), { className: "o" });
+      o.append(hlText(c.text, termsOf(c), (x) => document.createTextNode(x)));
+      box.append(o);
+    }
     if (c.tr) box.append(Object.assign(document.createElement("div"), { className: "tr", textContent: c.tr }));
     else if (subStyle() === "translation") box.append(Object.assign(document.createElement("div"), { className: "o", textContent: c.text }));
   }
@@ -356,6 +362,7 @@
     const i = cueAt(t);
     const c = i >= 0 ? V.cues[i] : null;
     showSub(c);
+    vocabRender();
     if (i !== curIdx) {
       curIdx = i;
       highlight();
@@ -396,7 +403,7 @@
       const body = document.createElement("div");
       const o = document.createElement("div");
       o.className = "o";
-      o.append(words(c.text));
+      o.append(hlText(c.text, termsOf(c), words));
       const t = document.createElement("div");
       t.className = "t";
       t.textContent = c.tr ?? (c.trErr >= 2 ? `（翻譯失敗：${c.trMsg || ""}）` : "…");
@@ -436,6 +443,235 @@
     if (player.getPlayerState?.() !== 1) player.playVideo();
     setTimeout(schedule, 50);
   }
+
+  // ---------- 單字表：影片右上角「本集 N 個字」（和插件 subs-core.js 的單字表一樣） ----------
+  // 翻好的句子每次挑一段（最多 VOCAB_N 句，離目前位置最近的先挑，同時只送一個請求）。挑到的字再掃一遍所有句子，
+  // 出現幾次就算幾次；字幕和逐字稿裡上色；點字跳到下一次出現的地方。
+  // ☆ 收藏（格式見 lib/core.js 的 BL.vocabRecord）：存在這個網頁的 localStorage，同時寫進英文閃卡的收件匣 flVideoInbox——
+  // 閃卡 App 和這個網頁在同一個網域（joshlin55688-debug.github.io），localStorage 共用，打開閃卡就自動收進「影片收藏」。
+  // 反過來讀閃卡的進度 flState：已熟悉的字變淡、字幕不上色，正在背的標「背」
+  const VOCAB_N = 20, LS_SAVED = "blyt-vocabSaved", LS_INBOX = "flVideoInbox", LS_FLASH = "flState";
+  const newVocab = () => ({ items: new Map(), list: [], hits: [], busy: 0, ver: 0, err: "" });
+  let saved = {};
+  try {
+    saved = JSON.parse(lsGet(LS_SAVED) || "{}") || {};
+  } catch {}
+  let flashMap = {};
+  function readFlash() {
+    try {
+      flashMap = BL.flashStatusMap(JSON.parse(lsGet(LS_FLASH) || "{}") || {});
+    } catch {
+      flashMap = {};
+    }
+  }
+  readFlash();
+  const flashOf = (it) => BL.flashStatus(flashMap, it.base);
+  function writeSaved(next) {
+    saved = next;
+    lsSet(LS_SAVED, JSON.stringify(saved));
+    lsSet(LS_INBOX, BL.vocabInbox(saved));
+    vocabRender(true);
+  }
+  let vbLast = "";
+  function vocabPump() {
+    const v = V;
+    if (!v || !E.getSettings().vocab) return;
+    const VB = (v.vocab ||= newVocab());
+    if (VB.busy) return;
+    const ok = v.cues.filter((c) => c.tr != null && !c.vq);
+    if (!ok.length) return;
+    const t = nowMs();
+    let k = 0;
+    ok.forEach((c, i) => Math.abs(c.start - t) < Math.abs(ok[k].start - t) && (k = i));
+    const take = ok.slice(Math.max(0, Math.min(k, ok.length - VOCAB_N)), Math.max(0, Math.min(k, ok.length - VOCAB_N)) + VOCAB_N);
+    take.forEach((c) => (c.vq = true));
+    VB.busy++;
+    vocabRender(true);
+    E.vocabBlock(take.map((c) => c.text), v.title ? { title: v.title, description: "" } : null).then((r) => {
+      VB.busy--;
+      if (v !== V || v.vocab !== VB) return;
+      if (r?.error) {
+        VB.err = r.error;
+        setTimeout(() => take.forEach((c) => (c.vq = false)), 30000); // 過一陣子再試
+      } else addVocab(v, take, r?.items || []);
+      vocabRender(true);
+      vocabPump();
+    });
+  }
+  function addVocab(v, cues, items) {
+    const VB = v.vocab;
+    const hit = (it, c, term) => !it.hits.some((h) => h.start === c.start && h.term === term) && it.hits.push({ start: c.start, term });
+    const fresh = [];
+    for (const x of items) {
+      const c = cues[x.i];
+      if (!c) continue;
+      const k = x.base.toLowerCase();
+      let it = VB.items.get(k);
+      if (!it) VB.items.set(k, (it = { key: k, base: x.base, zh: x.zh, level: x.level || 0, terms: new Set(), hits: [] })), fresh.push(it);
+      it.terms.add(x.term);
+      hit(it, c, x.term);
+    }
+    for (const it of VB.items.values()) for (const c of fresh.includes(it) ? v.cues : cues) for (const term of it.terms) if (BL.findTerm(c.text, term)) hit(it, c, term);
+    for (const it of VB.items.values()) it.hits.sort((p, q) => p.start - q.start);
+    VB.list = [...VB.items.values()].sort((p, q) => p.hits[0].start - q.hits[0].start);
+    VB.hits = VB.list.flatMap((it) => it.hits.map((h) => ({ start: h.start, term: h.term, key: it.key }))).sort((p, q) => p.start - q.start);
+    VB.ver++;
+    showSub(null);
+    tick();
+    renderList();
+    trackSaved(v);
+  }
+  // 這部影片裡那一句：原文、譯文、出處
+  function exampleOf(h) {
+    const c = V.cues.find((x) => x.start === h.start);
+    return { vid: V.vid, ex: c?.text || "", exTr: c?.tr || "", src: `https://www.youtube.com/watch?v=${V.vid}&t=${Math.floor(h.start / 1000)}s` };
+  }
+  // 收藏過的字在這部影片又出現：記下這部影片的例句、遇到次數 +1（同一部影片只算一次）
+  function trackSaved(v) {
+    const now = Date.now();
+    let next = null;
+    for (const it of v.vocab.items.values()) {
+      if (!BL.vocabLive(saved[it.key])) continue;
+      const rec = BL.vocabRecord(saved[it.key], it, exampleOf(it.hits[0]), now);
+      if (rec) (next ||= { ...saved })[it.key] = rec;
+    }
+    if (next) writeSaved(next);
+  }
+  // 這句要上色的寫法（閃卡裡已經熟悉的不上色）
+  const termsOf = (c) => (V?.vocab?.hits || []).filter((h) => h.start === c.start && flashOf(V.vocab.items.get(h.key)) !== "mastered").map((h) => h.term);
+  // 原文分段：單字表的字包在 .hl 裡；mk(片段) 產生一般內容（逐字稿用可點的單字、字幕用純文字）
+  function hlText(text, terms, mk) {
+    const frag = document.createDocumentFragment();
+    const spans = terms.map((t) => BL.findTerm(text, t)).filter(Boolean).sort((x, y) => x.start - y.start);
+    let at = 0;
+    for (const r of spans) {
+      if (r.start < at) continue;
+      frag.append(mk(text.slice(at, r.start)));
+      const hl = document.createElement("span");
+      hl.className = "hl";
+      hl.append(mk(text.slice(r.start, r.end)));
+      frag.append(hl);
+      at = r.end;
+    }
+    frag.append(mk(text.slice(at)));
+    return frag;
+  }
+  function vocabCurrent(t) {
+    const hs = V?.vocab?.hits || [];
+    let lo = 0, hi = hs.length;
+    while (lo < hi) {
+      const m = (lo + hi) >> 1;
+      if (hs[m].start <= t) lo = m + 1;
+      else hi = m;
+    }
+    const h = hs[lo - 1];
+    return h ? V.vocab.list.findIndex((it) => it.key === h.key) : -1;
+  }
+  let flashVer = 0;
+  function vocabRender(force) {
+    const box = $("vocab");
+    const s = E.getSettings();
+    const on = !!(V?.started && s.vocab && s.apiKey && !noPlayer);
+    box.hidden = !on;
+    if (!on) return;
+    const VB = V.vocab || newVocab();
+    const n = VB.list.length;
+    const cur = n ? vocabCurrent(nowMs() + offsetMs() + 200) : -1;
+    const savedN = Object.values(saved).filter(BL.vocabLive).length;
+    const key = [s.vocabCollapsed, VB.ver, cur, savedN, VB.busy, VB.err, flashVer].join("|");
+    if (!force && key === vbLast) return;
+    vbLast = key;
+    const q = (sel) => box.querySelector(sel);
+    q(".vp").hidden = !!s.vocabCollapsed;
+    q(".pill").hidden = !s.vocabCollapsed;
+    q(".pill").textContent = `單字 ${n}`;
+    q(".ttl").textContent = `本集 ${n} 個字`;
+    q(".pos").textContent = n ? `${Math.max(cur, 0) + 1} / ${n}` : "";
+    q('[data-act="export"]').textContent = `★${savedN} → 閃卡`;
+    q('[data-act="export"]').disabled = !savedN || !s.flashcardUrl;
+    if (s.vocabCollapsed) return;
+    const ls = q(".ls");
+    if (!n) {
+      const msg = VB.busy ? "挑字中…" : VB.err ? `沒有挑到字（${VB.err}）` : "還沒有字（翻好的句子才會挑）";
+      ls.replaceChildren(Object.assign(document.createElement("div"), { className: "empty", textContent: msg }));
+      return;
+    }
+    const SHOW = 5;
+    const from = Math.max(0, Math.min(n - SHOW, Math.max(cur, 0) - 2));
+    ls.replaceChildren(
+      ...VB.list.slice(from, from + SHOW).map((it, j) => {
+        const fl = flashOf(it);
+        const row = document.createElement("div");
+        row.className = "it" + (from + j === cur ? " on" : "") + (fl === "mastered" ? " known" : "");
+        row.dataset.k = it.key;
+        const tx = document.createElement("div");
+        tx.className = "tx";
+        tx.append(Object.assign(document.createElement("b"), { className: "t", textContent: it.base }), Object.assign(document.createElement("span"), { className: "z", textContent: it.zh }));
+        row.append(tx);
+        if (fl) row.append(Object.assign(document.createElement("span"), { className: `fl ${fl}`, textContent: fl === "mastered" ? "熟" : "背", title: fl === "mastered" ? "閃卡：已熟悉" : "閃卡：正在背" }));
+        if (it.hits.length > 1) row.append(Object.assign(document.createElement("span"), { className: "c", textContent: `×${it.hits.length}` }));
+        const on = BL.vocabLive(saved[it.key]);
+        const st = Object.assign(document.createElement("button"), { type: "button", className: "st", textContent: on ? "★" : "☆", title: on ? "取消收藏" : "收藏（自動同步到英文閃卡的「影片收藏」）" });
+        st.dataset.act = "star";
+        row.append(st);
+        return row;
+      }),
+    );
+  }
+  function toggleSave(k) {
+    const it = V?.vocab?.items.get(k);
+    if (!it) return;
+    const next = { ...saved };
+    const now = Date.now();
+    // 取消收藏不刪掉：留著標記，閃卡那邊收到後把還沒開始背的卡片拿掉
+    if (BL.vocabLive(next[k])) next[k] = BL.vocabRemove(next[k], now);
+    else {
+      const t = nowMs();
+      const h = [...it.hits].reverse().find((x) => x.start <= t + 500) || it.hits[0];
+      next[k] = BL.vocabRecord(next[k], it, exampleOf(h), now) || { ...next[k], removed: undefined, at: now };
+    }
+    writeSaved(next);
+  }
+  // 備案：收藏的字放在網址 # 後面帶給閃卡 App。平常不用按（同一個網域，打開閃卡就自動收）
+  function exportSaved() {
+    const url = E.getSettings().flashcardUrl;
+    if (!Object.values(saved).some(BL.vocabLive) || !url) return;
+    const bytes = new TextEncoder().encode(BL.vocabInbox(saved));
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    const b64 = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    open(`${url.replace(/#.*$/, "")}#import=${b64}`, "_blank", "noopener");
+  }
+  $("vocab").addEventListener("click", (e) => {
+    const act = e.target.closest("[data-act]")?.dataset.act;
+    const k = e.target.closest(".it")?.dataset.k;
+    if (act === "star") return k && toggleSave(k);
+    if (act === "export") return exportSaved();
+    if (act === "collapse" || act === "expand") return E.saveSettings({ vocabCollapsed: act === "collapse" }), vocabRender(true);
+    const it = k && V?.vocab?.items.get(k);
+    if (!it) return;
+    const t = nowMs();
+    seek((it.hits.find((x) => x.start > t + 500) || it.hits[0]).start);
+  });
+  // 另一個分頁改了收藏或閃卡進度（例如在閃卡 App 背完一輪）：跟著更新
+  function flashChanged() {
+    readFlash();
+    flashVer++;
+    if (V?.vocab) V.vocab.ver++;
+    showSub(null);
+    tick();
+    renderList();
+    vocabRender(true);
+  }
+  addEventListener("storage", (e) => {
+    if (e.key === LS_SAVED) {
+      try {
+        saved = JSON.parse(e.newValue || "{}") || {};
+      } catch {}
+      vocabRender(true);
+    } else if (e.key === LS_FLASH) flashChanged();
+  });
+  document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && flashChanged());
 
   // ---------- 查字典 ----------
   async function lookup(el) {
@@ -503,6 +739,7 @@
     if (!V) return;
     V.wins = new Map();
     V.cues = [];
+    V.vocab = newVocab();
     V.gen = (V.gen || 0) + 1;
     V.inflight = 0;
     curIdx = -1;
@@ -538,7 +775,9 @@
   // ---------- 設定 ----------
   function openSettings() {
     const s = E.getSettings();
-    for (const k of ["apiKey", "targetLang", "model", "glossary", "instructions"]) $(k).value = s[k] ?? "";
+    for (const k of ["apiKey", "targetLang", "model", "glossary", "instructions", "flashcardUrl"]) $(k).value = s[k] ?? "";
+    $("vocab").checked = s.vocab !== false;
+    $("vocabMinLevel").value = String([2, 3, 4, 5].includes(Number(s.vocabMinLevel)) ? Number(s.vocabMinLevel) : 4);
     $("testResult").textContent = "";
     showUsage();
     $("settings").showModal();
@@ -551,8 +790,20 @@
       model: $("model").value.trim() || E.DEFAULTS.model,
       glossary: $("glossary").value,
       instructions: $("instructions").value,
+      vocab: $("vocab").checked,
+      vocabMinLevel: Number($("vocabMinLevel").value) || 4,
+      flashcardUrl: /^https?:\/\//.test($("flashcardUrl").value.trim()) ? $("flashcardUrl").value.trim() : "",
     };
     E.saveSettings(next);
+    // 單字表打開、或門檻改了：重挑（挑過的段落有快取，不重花錢）
+    if (V && (next.vocab !== prev.vocab || next.vocabMinLevel !== Number(prev.vocabMinLevel))) {
+      V.vocab = newVocab();
+      V.cues.forEach((c) => (c.vq = false));
+      showSub(null);
+      renderList();
+      vocabRender(true);
+      vocabPump();
+    }
     // 翻譯設定改了：已顯示的譯文重翻（快取鍵含這些設定，不會白花錢在沒變的部分）
     if (V && (prev.targetLang !== next.targetLang || prev.model !== next.model || prev.glossary !== next.glossary || prev.instructions !== next.instructions)) {
       V.cues.forEach((c) => ((c.tr = null), (c.trErr = 0)));
@@ -567,7 +818,7 @@
   }
   $("openSettings").addEventListener("click", openSettings);
   $("settings").addEventListener("close", saveForm);
-  for (const k of ["apiKey", "targetLang", "model", "glossary", "instructions"]) $(k).addEventListener("change", saveForm);
+  for (const k of ["apiKey", "targetLang", "model", "glossary", "instructions", "vocab", "vocabMinLevel", "flashcardUrl"]) $(k).addEventListener("change", saveForm);
   $("showKey").addEventListener("click", () => {
     const i = $("apiKey");
     i.type = i.type === "password" ? "text" : "password";

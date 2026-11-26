@@ -10,7 +10,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = path.join(root, "test", "out");
 fs.mkdirSync(outDir, { recursive: true });
 const PORT = 8795;
-const calls = { transcribe: [], translate: [], word: [] };
+const calls = { transcribe: [], translate: [], word: [], vocab: [] };
 
 const mmss = (s) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, "0")}`;
 function gemini(body) {
@@ -42,10 +42,22 @@ function gemini(body) {
     }
     return { status: 200, body: reply({ segs }) };
   }
-  if (/dictionary/i.test(sys)) {
+  if (/dictionary/i.test(sys) && !/language learner/.test(sys)) {
     const word = JSON.parse(parts[0].text).word;
     calls.word.push(word);
     return { status: 200, body: reply({ word, phonetic: "/fake/", entries: [{ pos: "名詞", defs: ["假的釋義"] }] }) };
+  }
+  // 單字表：第 2 句挑「Spoken line」、第 5 句挑「of the talk」（片語，留著）、第 4 句挑 talk（學測 Level 1，濾掉）
+  if (/language learner/.test(sys)) {
+    const items = JSON.parse(parts[0].text).items;
+    calls.vocab.push(items.map((x) => x.text));
+    const v = [];
+    for (const x of items) {
+      if (/line 2 /.test(x.text)) v.push({ id: x.id, term: "Spoken line", base: "spoken line", zh: "口說的一行" });
+      if (/line 4 /.test(x.text)) v.push({ id: x.id, term: "talk", base: "talk", zh: "談話" });
+      if (/line 5 /.test(x.text)) v.push({ id: x.id, term: "of the talk", base: "of the talk", zh: "這場演講的" });
+    }
+    return { status: 200, body: reply({ v }) };
   }
   const items = JSON.parse(parts[0].text).items;
   calls.translate.push(...items);
@@ -264,6 +276,84 @@ await tap("#start");
 await page.evaluate(() => (window.__fake.seekTo(2), window.__fake.playVideo()));
 await until(async () => /【譯】/.test(await text("#subs .box")));
 check("R1 重看同一部影片走快取，不再花錢", calls.transcribe.length === before, `${calls.transcribe.length - before} 次新請求`);
+
+// 單字表（2026-11-27 使用者要「本集 N 個字」的片語／單字表）：接在 R1 後面，影片正在播 0:02 左右
+await page.evaluate((u) => { const s = JSON.parse(localStorage.getItem("blyt-settings")); s.flashcardUrl = u; localStorage.setItem("blyt-settings", JSON.stringify(s)); localStorage.removeItem("blyt-vocabSaved"); }, `${BASE}flash.html`);
+const vocabView = () =>
+  page.evaluate(() => {
+    const box = document.getElementById("vocab");
+    const br = box.getBoundingClientRect(), sr = document.getElementById("stage").getBoundingClientRect();
+    return {
+      shown: !box.hidden,
+      topRight: br.right <= sr.right && br.left > sr.left + sr.width / 2 && br.top >= sr.top && br.top < sr.top + sr.height / 3,
+      ttl: box.querySelector(".ttl").textContent,
+      collapsed: box.querySelector(".vp").hidden,
+      pill: box.querySelector(".pill").hidden ? "" : box.querySelector(".pill").textContent,
+      exp: box.querySelector('[data-act="export"]').textContent,
+      items: [...box.querySelectorAll(".it")].map((it) => ({ k: it.dataset.k, t: it.querySelector(".t").textContent, z: it.querySelector(".z").textContent, c: it.querySelector(".c")?.textContent || "", on: it.classList.contains("on"), star: it.querySelector(".st").textContent })),
+      subHl: [...document.querySelectorAll("#subs .hl")].map((x) => x.textContent),
+      rowHl: document.querySelectorAll(".row .hl").length,
+    };
+  });
+const v1 = await until(async () => { const v = await vocabView(); return v.items.length === 2 && v.subHl.length ? v : null; });
+check(
+  "V1 單字表：影片右上角列出挑到的字（Level 1 的 talk 濾掉、片語留著、出現幾次標 ×N），字幕和逐字稿上色",
+  v1?.shown && v1.topRight && v1.ttl === "本集 2 個字" && v1.items.map((x) => x.t).join(",") === "spoken line,of the talk" && v1.items.some((x) => x.on) && /^×\d+$/.test(v1.items[0].c) && v1.subHl.length >= 1 && v1.rowHl > 0 && calls.vocab.length >= 1,
+  JSON.stringify({ v1, vocabCalls: calls.vocab.length }),
+);
+await page.evaluate(() => window.__fake.pauseVideo());
+await page.$eval('#vocab .it[data-k="of the talk"] .st', (e) => e.click());
+const saved2 = await page.evaluate(() => JSON.parse(localStorage.getItem("blyt-vocabSaved") || "{}"));
+const s2 = saved2["of the talk"];
+const e2 = s2?.exs?.[0];
+const inbox2 = await page.evaluate(() => JSON.parse(localStorage.getItem("flVideoInbox") || "null"));
+check(
+  "V2 收藏：存原形、意思、這部影片的那一句（原文＋譯文＋網址秒數）、遇到 1 次；同時寫進英文閃卡的收件匣",
+  s2?.w === "of the talk" && s2.zh === "這場演講的" && s2.seen === 1 && e2?.vid === "AAAAAAAAAAA" && /^Spoken line \d+ of the talk\.$/.test(e2.ex) && /^【譯】Spoken line/.test(e2.exTr) &&
+    /^https:\/\/www\.youtube\.com\/watch\?v=AAAAAAAAAAA&t=\d+s$/.test(e2.src) && (await vocabView()).exp === "★1 → 閃卡" && inbox2?.v === 1 && inbox2.items[0]?.w === "of the talk",
+  JSON.stringify({ s2, inbox2 }),
+);
+const t3a = await page.evaluate(() => window.__fake.getCurrentTime());
+await page.$eval('#vocab .it[data-k="spoken line"]', (e) => e.click());
+await sleep(300);
+const t3b = await page.evaluate(() => window.__fake.getCurrentTime());
+const tab4 = browser.waitForTarget((t) => t.url().includes("/flash.html#import="), { timeout: 5000 }).catch(() => null);
+await page.$eval('#vocab [data-act="export"]', (e) => e.click());
+const target4 = await tab4;
+let got4 = null;
+if (target4) {
+  got4 = JSON.parse(Buffer.from(target4.url().split("#import=")[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
+  await (await target4.page())?.close();
+}
+check("V3 點字跳到它下一次出現的那句；「→ 閃卡」打開閃卡網址，# 後面是收藏的字", t3b > t3a + 0.5 && t3b < t3a + 12 && got4?.v === 1 && got4.items[0]?.w === "of the talk", JSON.stringify({ t3a, t3b, got4 }));
+await page.$eval('#vocab [data-act="collapse"]', (e) => e.click());
+const v4 = await vocabView();
+const set4 = await page.evaluate(() => JSON.parse(localStorage.getItem("blyt-settings")).vocabCollapsed);
+await page.$eval("#vocab .pill", (e) => e.click());
+const v4b = await vocabView();
+check("V4 收起單字表：只剩「單字 N」小按鈕、設定記住；點它再打開", v4.collapsed && v4.pill === "單字 2" && set4 === true && !v4b.collapsed, JSON.stringify({ v4: { collapsed: v4.collapsed, pill: v4.pill }, set4 }));
+// V5 閃卡進度（同一個網域的 localStorage flState）：已熟悉的字變淡標「熟」、字幕和逐字稿不上色；正在背的標「背」
+await page.evaluate(() => {
+  localStorage.setItem("flState", JSON.stringify({ v_of_the_talk: { status: "mastered" }, v_spoken_line: { status: "learning" }, _streak: {} }));
+  document.dispatchEvent(new Event("visibilitychange"));
+});
+await sleep(400);
+const v5 = await page.evaluate(() => ({
+  items: [...document.querySelectorAll("#vocab .it")].map((it) => ({ k: it.dataset.k, known: it.classList.contains("known"), fl: it.querySelector(".fl")?.textContent || "" })),
+  subHl: [...document.querySelectorAll("#subs .hl")].map((x) => x.textContent),
+  rowHl: [...new Set([...document.querySelectorAll(".row .hl")].map((x) => x.textContent))],
+}));
+const k5 = (k) => v5.items.find((x) => x.k === k);
+check(
+  "V5 讀英文閃卡的進度：已熟悉的變淡標「熟」、不上色；正在背的標「背」、照樣上色",
+  k5("of the talk")?.known && k5("of the talk").fl === "熟" && !k5("spoken line")?.known && k5("spoken line")?.fl === "背" && !v5.rowHl.includes("of the talk") && v5.rowHl.includes("Spoken line"),
+  JSON.stringify(v5),
+);
+// V6 取消收藏：不刪掉，標記取消（閃卡那邊收到後拿掉還沒背的卡片）；收件匣跟著更新
+await page.$eval('#vocab .it[data-k="of the talk"] .st', (e) => e.click());
+const v6 = await page.evaluate(() => ({ saved: JSON.parse(localStorage.getItem("blyt-vocabSaved"))["of the talk"], inbox: JSON.parse(localStorage.getItem("flVideoInbox")).items.find((x) => x.w === "of the talk"), exp: document.querySelector('#vocab [data-act="export"]').textContent }));
+check("V6 取消收藏：留著 removed 標記、收件匣跟著更新、收藏數變 0", v6.saved?.removed === true && v6.inbox?.removed === true && v6.exp === "★0 → 閃卡", JSON.stringify(v6));
+await page.evaluate(() => localStorage.removeItem("flState"));
 
 // 不能嵌入的影片：照順序轉出逐字稿，到沒有語音為止
 await loadVideo("https://youtu.be/NOEMBED0001");
